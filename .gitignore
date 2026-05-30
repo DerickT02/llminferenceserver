@@ -1,0 +1,23 @@
+# virtual environment
+venv/
+
+# models (large binary files, don't commit these)
+models/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# env files (API keys, config secrets)
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# editor
+.vscode/
+.idea/
