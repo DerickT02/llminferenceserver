@@ -178,6 +178,27 @@ class TestBatchLoop:
         assert batch_sizes == [1, 1]
 
 
+class TestHighVolume:
+
+    @pytest.mark.asyncio
+    async def test_100_concurrent_requests(self, fresh_queue, mock_engine):
+        import server.main as m
+
+        loop = asyncio.get_event_loop()
+        n = 100
+        futures = []
+        for i in range(n):
+            fut = loop.create_future()
+            await fresh_queue.put(({"prompt": f"prompt_{i}", "max_tokens": 128}, fut))
+            futures.append(fut)
+
+        results = await _run_loop_until(mock_engine, *futures, timeout=10.0)
+
+        assert len(results) == n
+        assert results == [f"result:prompt_{i}" for i in range(n)]
+        assert mock_engine.generate.call_count == n
+
+
 class TestHandleRequest:
 
     @pytest.mark.asyncio
