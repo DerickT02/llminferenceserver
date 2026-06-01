@@ -1,5 +1,7 @@
 import pytest
 import asyncio
+import time
+import threading
 from unittest.mock import MagicMock
 
 
@@ -197,6 +199,133 @@ class TestHighVolume:
         assert len(results) == n
         assert results == [f"result:prompt_{i}" for i in range(n)]
         assert mock_engine.generate.call_count == n
+
+
+class TestHeadOfLineBlocking:
+
+    @pytest.mark.asyncio
+    async def test_slow_request_blocks_fast_requests(self, fresh_queue):
+        """
+        Demonstrates head-of-line blocking: a slow request occupies the batch_loop's
+        executor call, so fast requests queued while it runs cannot be dispatched
+        until the slow one finishes — even though they themselves are instant.
+        """
+        import server.main as m
+
+        SLOW_DURATION = 0.15  # 150ms
+
+        slow_started = threading.Event()
+
+        def generate(prompt):
+            if prompt == "slow":
+                slow_started.set()
+                time.sleep(SLOW_DURATION)
+            return f"result:{prompt}"
+
+        engine = MagicMock()
+        engine.generate.side_effect = generate
+
+        loop = asyncio.get_event_loop()
+
+        # Enqueue the slow request and start the batch_loop
+        slow_fut = loop.create_future()
+        await fresh_queue.put(({"prompt": "slow", "max_tokens": 128}, slow_fut))
+        task = asyncio.create_task(m.batch_loop(engine))
+
+        # Block until the slow request is actually executing in the thread pool
+        await loop.run_in_executor(None, slow_started.wait)
+
+        # Enqueue fast requests while slow is mid-execution
+        fast_futs = []
+        t0 = loop.time()
+        for i in range(3):
+            fut = loop.create_future()
+            await fresh_queue.put(({"prompt": f"fast_{i}", "max_tokens": 128}, fut))
+            fast_futs.append(fut)
+
+        await asyncio.gather(*fast_futs)
+        fast_wait = loop.time() - t0
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # The fast requests were blocked for the remaining ~150ms of the slow request.
+        # Under a scheduler with per-request prioritisation they would complete in <1ms.
+        assert fast_wait >= SLOW_DURATION * 0.8, (
+            f"Fast requests completed in {fast_wait * 1000:.0f}ms — "
+            f"expected head-of-line blocking to delay them by ~{SLOW_DURATION * 1000:.0f}ms"
+        )
+        assert slow_fut.result() == "result:slow"
+        assert [f.result() for f in fast_futs] == [f"result:fast_{i}" for i in range(3)]
+
+
+    @pytest.mark.asyncio
+    async def test_large_prompt_blocks_small_prompts(self, fresh_queue):
+        """
+        Demonstrates that prompt size drives head-of-line blocking: a large prompt
+        with long inference time prevents small, fast prompts from being dispatched
+        until the large one finishes — even though they would complete in <1ms on
+        their own.
+        """
+        import server.main as m
+
+        CHARS_PER_SECOND = 50_000  # simulated inference throughput
+
+        LARGE_PROMPT = "x" * 10_000  # ~200ms at simulated throughput
+        SMALL_PROMPT = "y" * 10      # ~0.2ms at simulated throughput
+
+        large_started = threading.Event()
+
+        def generate(prompt):
+            duration = len(prompt) / CHARS_PER_SECOND
+            if len(prompt) > 1_000:
+                large_started.set()
+            time.sleep(duration)
+            return f"result:len={len(prompt)}"
+
+        engine = MagicMock()
+        engine.generate.side_effect = generate
+
+        loop = asyncio.get_event_loop()
+
+        large_fut = loop.create_future()
+        await fresh_queue.put(({"prompt": LARGE_PROMPT, "max_tokens": 128}, large_fut))
+        task = asyncio.create_task(m.batch_loop(engine))
+
+        # Block until the large prompt is actually executing in the thread pool
+        await loop.run_in_executor(None, large_started.wait)
+
+        # Queue small prompts while the large one is mid-execution
+        small_futs = []
+        t0 = loop.time()
+        for _ in range(3):
+            fut = loop.create_future()
+            await fresh_queue.put(({"prompt": SMALL_PROMPT, "max_tokens": 128}, fut))
+            small_futs.append(fut)
+
+        await asyncio.gather(*small_futs)
+        small_wait = loop.time() - t0
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        expected_large_duration = len(LARGE_PROMPT) / CHARS_PER_SECOND
+
+        # Small prompts were blocked for the remainder of the large prompt's runtime.
+        # A scheduler aware of prompt size could have served them in <1ms.
+        assert small_wait >= expected_large_duration * 0.5, (
+            f"Small prompts completed in {small_wait * 1000:.0f}ms — "
+            f"expected to be blocked ~{expected_large_duration * 1000:.0f}ms "
+            "by the large prompt"
+        )
+        assert large_fut.result() == f"result:len={len(LARGE_PROMPT)}"
+        assert all(f.result() == f"result:len={len(SMALL_PROMPT)}" for f in small_futs)
 
 
 class TestHandleRequest:
